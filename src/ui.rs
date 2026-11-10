@@ -1,13 +1,14 @@
 use crate::{
     charts::{self, Chart, SAMPLES},
     diagnostics,
-    network::{self, Ping, Scan, Snapshot},
+    network::{self, Ping, Snapshot},
 };
 use std::{
     cell::RefCell,
     collections::VecDeque,
+    ffi::OsString,
     fs,
-    mem::size_of,
+    mem::{size_of, take},
     os::windows::{ffi::OsStringExt, process::CommandExt},
     path::PathBuf,
     process::{Command, Stdio},
@@ -23,7 +24,10 @@ use windows_sys::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::{LibraryLoader::GetModuleHandleW, SystemInformation::GetLocalTime},
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            SystemInformation::{GetLocalTime, GetSystemDirectoryW},
+        },
         UI::{
             Controls::{Dialogs::*, *},
             HiDpi::GetDpiForWindow,
@@ -143,55 +147,110 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     unsafe {
-        if msg == WM_DESTROY {
-            KillTimer(hwnd, 1);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            PostQuitMessage(0);
-            return 0;
+        match msg {
+            WM_DESTROY => {
+                KillTimer(hwnd, 1);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                PostQuitMessage(0);
+                return 0;
+            }
+            // Needs no app state, and also arrives before the app state exists.
+            WM_GETMINMAXINFO if lparam != 0 => {
+                let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+                let info = &mut *(lparam as *mut MINMAXINFO);
+                info.ptMinTrackSize.x = px(900, dpi);
+                info.ptMinTrackSize.y = px(630, dpi);
+                return 0;
+            }
+            _ => (),
         }
         let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<App>;
+        let mut handled = None;
         if let Some(state) = state.as_ref() {
             // Native controls may synchronously send messages during an update.
             if let Ok(mut app) = state.try_borrow_mut() {
-                match msg {
-                    WM_SIZE => app.layout(),
-                    WM_GETMINMAXINFO => {
-                        let min = &mut *(lparam as *mut MINMAXINFO);
-                        min.ptMinTrackSize.x = app.px(900);
-                        min.ptMinTrackSize.y = app.px(630);
-                    }
-                    WM_TIMER if wparam == 1 => app.update(),
-                    WM_COMMAND if (wparam >> 16) & 0xffff == 0 && lparam != 0 => {
-                        app.command(wparam & 0xffff);
-                    }
-                    WM_NOTIFY if lparam != 0 => {
-                        let header = &*(lparam as *const NMHDR);
-                        if header.hwndFrom == app.tabs && header.code == TCN_SELCHANGE {
-                            let tab = SendMessageW(app.tabs, TCM_GETCURSEL, 0, 0);
-                            if (0..4).contains(&tab) {
-                                app.select_page(tab as usize);
-                            }
-                        } else {
-                            return DefWindowProcW(hwnd, msg, wparam, lparam);
-                        }
-                    }
-                    WM_DRAWITEM if lparam != 0 => {
-                        let item = &*(lparam as *const DRAWITEMSTRUCT);
-                        let chart = match wparam {
-                            SIGNAL_CHART => Chart::Signal(&app.history, &app.snapshot),
-                            CHANNEL_CHART => Chart::Channels(&app.snapshot),
-                            _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
-                        };
-                        charts::draw(item, app.small_font, app.dpi, chart);
-                        return 1;
-                    }
-                    _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+                handled = app.handle(msg, wparam, lparam);
+                let modals = take(&mut app.modals);
+                // Release the borrow first: dialogs and DefWindowProc (moving, sizing)
+                // run nested message loops that must still reach the app.
+                drop(app);
+                for modal in modals {
+                    show_modal(hwnd, modal);
                 }
-                return 0;
             }
         }
-        DefWindowProcW(hwnd, msg, wparam, lparam)
+        handled.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
     }
+}
+
+/// Work that opens a modal dialog. It runs after the app state is released.
+enum Modal {
+    Message(&'static str, String, MESSAGEBOX_STYLE),
+    Export(String),
+}
+
+fn show_modal(hwnd: HWND, modal: Modal) {
+    match modal {
+        Modal::Message(title, body, icon) => message(hwnd, title, &body, icon),
+        Modal::Export(report) => export_report(hwnd, &report),
+    }
+}
+
+fn export_report(hwnd: HWND, report: &str) {
+    let mut file = wide(&format!("WiFi检测报告_{}.txt", clock(true)));
+    file.resize(32768, 0);
+    let filter = wide("文本文件 (*.txt)\0*.txt\0");
+    let mut dialog = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: filter.as_ptr(),
+        nFilterIndex: 1,
+        lpstrFile: file.as_mut_ptr(),
+        nMaxFile: file.len() as u32,
+        lpstrDefExt: w!("txt"),
+        lpstrTitle: w!("导出 WiFi 检测报告"),
+        Flags: OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    if unsafe { GetSaveFileNameW(&mut dialog) } == 0 {
+        let error = unsafe { CommDlgExtendedError() };
+        if error != 0 {
+            message(
+                hwnd,
+                "导出失败",
+                &format!("保存窗口错误（{error}）。"),
+                MB_ICONERROR,
+            );
+        }
+        return;
+    }
+    let len = file.iter().position(|&ch| ch == 0).unwrap_or(file.len());
+    let path = PathBuf::from(OsString::from_wide(&file[..len]));
+    match fs::write(&path, report) {
+        Ok(()) => message(
+            hwnd,
+            "导出报告",
+            &format!(
+                "报告已保存到\r\n{}\r\n\r\n为保护隐私，报告中的 MAC 地址仅保留厂商前缀。",
+                path.display()
+            ),
+            MB_ICONINFORMATION,
+        ),
+        Err(error) => message(hwnd, "导出失败", &error.to_string(), MB_ICONERROR),
+    }
+}
+
+/// Resolves a Windows tool inside System32. A bare program name is not safe here:
+/// Windows searches the folder this program runs from before the system folder.
+fn system_tool(name: &str) -> PathBuf {
+    let mut buffer = [0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    let directory = if len == 0 || len >= buffer.len() {
+        PathBuf::from(r"C:\Windows\System32")
+    } else {
+        PathBuf::from(OsString::from_wide(&buffer[..len]))
+    };
+    directory.join(name)
 }
 
 #[derive(Clone, Copy)]
@@ -256,8 +315,10 @@ struct App {
     pings: Vec<Ping>,
     dns_ms: Option<f64>,
     ping_active: Arc<AtomicBool>,
-    rescan_requested: bool,
+    rescan_sent: u64,
+    rescan_waiting: bool,
     advice_text: String,
+    modals: Vec<Modal>,
     monitor: Receiver<Snapshot>,
     refresh: Sender<()>,
     tasks: Receiver<TaskResult>,
@@ -432,8 +493,10 @@ impl App {
             pings: Vec::new(),
             dns_ms: None,
             ping_active,
-            rescan_requested: false,
+            rescan_sent: 0,
+            rescan_waiting: false,
             advice_text: String::new(),
+            modals: Vec::new(),
             monitor,
             refresh,
             tasks,
@@ -443,6 +506,112 @@ impl App {
 
     fn px(&self, value: i32) -> i32 {
         px(value, self.dpi)
+    }
+
+    /// Returns `None` for messages that should go to `DefWindowProcW`.
+    unsafe fn handle(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+        unsafe {
+            match msg {
+                WM_SIZE => self.layout(),
+                WM_TIMER if wparam == 1 => self.update(),
+                WM_COMMAND if (wparam >> 16) & 0xffff == 0 && lparam != 0 => {
+                    self.command(wparam & 0xffff);
+                }
+                WM_NOTIFY if lparam != 0 => {
+                    let header = &*(lparam as *const NMHDR);
+                    if header.hwndFrom != self.tabs || header.code != TCN_SELCHANGE {
+                        return None;
+                    }
+                    let tab = SendMessageW(self.tabs, TCM_GETCURSEL, 0, 0);
+                    if (0..4).contains(&tab) {
+                        self.select_page(tab as usize);
+                    }
+                }
+                WM_DRAWITEM if lparam != 0 => {
+                    let item = &*(lparam as *const DRAWITEMSTRUCT);
+                    let chart = match wparam {
+                        SIGNAL_CHART => Chart::Signal(&self.history, &self.snapshot),
+                        CHANNEL_CHART => Chart::Channels(&self.snapshot),
+                        _ => return None,
+                    };
+                    charts::draw(item, self.small_font, self.dpi, chart);
+                    return Some(1);
+                }
+                WM_DPICHANGED if lparam != 0 => {
+                    let suggested = *(lparam as *const RECT);
+                    self.set_dpi((wparam & 0xffff) as i32);
+                    SetWindowPos(
+                        self.hwnd,
+                        null_mut(),
+                        suggested.left,
+                        suggested.top,
+                        suggested.right - suggested.left,
+                        suggested.bottom - suggested.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    // WM_SIZE from SetWindowPos arrives while this call holds the state.
+                    self.layout();
+                    self.invalidate_charts();
+                }
+                _ => return None,
+            }
+            Some(0)
+        }
+    }
+
+    fn notify(&mut self, title: &'static str, body: impl Into<String>, icon: MESSAGEBOX_STYLE) {
+        self.modals.push(Modal::Message(title, body.into(), icon));
+    }
+
+    fn set_dpi(&mut self, dpi: i32) {
+        let dpi = dpi.max(96);
+        if dpi == self.dpi {
+            return;
+        }
+        let old = [
+            self.font,
+            self.title_font,
+            self.heading_font,
+            self.small_font,
+        ];
+        self.dpi = dpi;
+        self.font = font(15, FW_NORMAL, dpi);
+        self.title_font = font(25, FW_BOLD, dpi);
+        self.heading_font = font(16, FW_SEMIBOLD, dpi);
+        self.small_font = font(12, FW_NORMAL, dpi);
+        self.apply_fonts();
+        for font in old {
+            if !font.is_null() {
+                unsafe { DeleteObject(font) };
+            }
+        }
+        let padding = (px(5, dpi) << 16) | px(10, dpi);
+        unsafe { SendMessageW(self.tabs, TCM_SETPADDING, 0, padding as isize) };
+    }
+
+    fn apply_fonts(&self) {
+        let set = |hwnd: HWND, font: HFONT| unsafe {
+            SendMessageW(hwnd, WM_SETFONT, font as usize, 1);
+        };
+        for &control in [self.status, self.scan, self.export, self.tabs]
+            .iter()
+            .chain(self.pages.iter().flatten())
+        {
+            set(control, self.font);
+        }
+        for control in [self.title, self.overview.score] {
+            set(control, self.title_font);
+        }
+        for control in [
+            self.overview.connection_title,
+            self.overview.score_title,
+            self.overview.chart_title,
+            self.networks.title,
+            self.networks.chart_title,
+            self.recommendations.title,
+        ] {
+            set(control, self.heading_font);
+        }
     }
 
     fn select_page(&mut self, index: usize) {
@@ -570,12 +739,12 @@ impl App {
                 format!("未连接 WiFi  ·  {}", self.snapshot.scan.note())
             };
             text(self.status, &status);
-            if self.rescan_requested && self.snapshot.scan != Scan::Running {
-                self.rescan_requested = false;
+            if self.rescan_waiting && self.snapshot.rescan_done >= self.rescan_sent {
+                self.rescan_waiting = false;
                 enable(self.scan, true);
             }
             if connection_changed || route_changed {
-                let rows = diagnostics::connection_rows(&self.snapshot);
+                let rows = diagnostics::connection_rows(&self.snapshot, false);
                 set_rows(
                     self.overview.rows,
                     rows.iter().map(|(key, val)| [*key, val.as_str()]),
@@ -640,13 +809,10 @@ impl App {
                 TaskResult::Flush(result) => {
                     enable(self.recommendations.buttons[0], true);
                     match result {
-                        Ok(()) => message(
-                            self.hwnd,
-                            "刷新 DNS 缓存",
-                            "DNS 缓存已刷新。",
-                            MB_ICONINFORMATION,
-                        ),
-                        Err(error) => message(self.hwnd, "刷新 DNS 缓存", &error, MB_ICONWARNING),
+                        Ok(()) => {
+                            self.notify("刷新 DNS 缓存", "DNS 缓存已刷新。", MB_ICONINFORMATION)
+                        }
+                        Err(error) => self.notify("刷新 DNS 缓存", error, MB_ICONWARNING),
                     }
                 }
             }
@@ -686,19 +852,30 @@ impl App {
     fn command(&mut self, id: usize) {
         match id {
             RESCAN if self.refresh.send(()).is_ok() => {
-                self.rescan_requested = true;
+                // The monitor numbers requests in the same order and reports the
+                // latest one whose scan has finished.
+                self.rescan_sent += 1;
+                self.rescan_waiting = true;
                 enable(self.scan, false);
                 text(self.status, "正在重新检测…");
             }
-            EXPORT => self.export_report(),
+            EXPORT => {
+                let report = diagnostics::report(
+                    &self.snapshot,
+                    &self.pings,
+                    self.dns_ms,
+                    &clock(false),
+                    true,
+                );
+                self.modals.push(Modal::Export(report));
+            }
             PING => self.start_ping(),
             FLUSH => self.flush_dns(),
             ROUTER => {
                 if let Some(gateway) = self.snapshot.route.gateway {
                     self.open(&format!("http://{gateway}"));
                 } else {
-                    message(
-                        self.hwnd,
+                    self.notify(
                         "打开路由器管理页",
                         "暂未获取到 IPv4 网关地址。",
                         MB_ICONWARNING,
@@ -711,7 +888,7 @@ impl App {
         }
     }
 
-    fn open(&self, target: &str) {
+    fn open(&mut self, target: &str) {
         let target = wide(target);
         let result = unsafe {
             ShellExecuteW(
@@ -724,12 +901,7 @@ impl App {
             )
         };
         if result as isize <= 32 {
-            message(
-                self.hwnd,
-                "打开失败",
-                "Windows 无法打开此地址。",
-                MB_ICONWARNING,
-            );
+            self.notify("打开失败", "Windows 无法打开此地址。", MB_ICONWARNING);
         }
     }
 
@@ -759,7 +931,7 @@ impl App {
         enable(self.recommendations.buttons[0], false);
         let sender = self.task_sender.clone();
         thread::spawn(move || {
-            let result = Command::new("ipconfig.exe")
+            let result = Command::new(system_tool("ipconfig.exe"))
                 .arg("/flushdns")
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -778,48 +950,6 @@ impl App {
                 });
             let _ = sender.send(TaskResult::Flush(result));
         });
-    }
-
-    fn export_report(&self) {
-        let mut file = wide(&format!("WiFi检测报告_{}.txt", clock(true)));
-        file.resize(32768, 0);
-        let filter = wide("文本文件 (*.txt)\0*.txt\0");
-        let mut dialog = OPENFILENAMEW {
-            lStructSize: size_of::<OPENFILENAMEW>() as u32,
-            hwndOwner: self.hwnd,
-            lpstrFilter: filter.as_ptr(),
-            nFilterIndex: 1,
-            lpstrFile: file.as_mut_ptr(),
-            nMaxFile: file.len() as u32,
-            lpstrDefExt: w!("txt"),
-            lpstrTitle: w!("导出 WiFi 检测报告"),
-            Flags: OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
-            ..Default::default()
-        };
-        if unsafe { GetSaveFileNameW(&mut dialog) } == 0 {
-            let error = unsafe { CommDlgExtendedError() };
-            if error != 0 {
-                message(
-                    self.hwnd,
-                    "导出失败",
-                    &format!("保存窗口错误（{error}）。"),
-                    MB_ICONERROR,
-                );
-            }
-            return;
-        }
-        let len = file.iter().position(|&ch| ch == 0).unwrap_or(file.len());
-        let path = PathBuf::from(std::ffi::OsString::from_wide(&file[..len]));
-        let report = diagnostics::report(&self.snapshot, &self.pings, self.dns_ms, &clock(false));
-        match fs::write(&path, report) {
-            Ok(()) => message(
-                self.hwnd,
-                "导出报告",
-                &format!("报告已保存到\r\n{}", path.display()),
-                MB_ICONINFORMATION,
-            ),
-            Err(error) => message(self.hwnd, "导出失败", &error.to_string(), MB_ICONERROR),
-        }
     }
 }
 

@@ -36,7 +36,7 @@
 
 需要 Windows、Rust stable 的 MSVC 工具链，以及安装了 **使用 C++ 的桌面开发** 工作负载的 Visual Studio Build Tools。项目已在 Windows 11 x64 上验证。 [Rust 安装指南](https://rust-lang.org/tools/install/)
 
-在 PowerShell 中运行以下命令。克隆私有仓库时，请使用有访问权限的 GitHub 账号。
+在 PowerShell 中运行以下命令（需要 Rust 1.87 或更新版本）。
 
 ```powershell
 git clone https://github.com/bTLzJazz/rust-win32-wifi-tool.git
@@ -51,6 +51,8 @@ cargo build --release --locked
 
 - **信道推荐**根据扫描到的接入点、信号强度和信道重叠估算。实际可选信道以路由器设置为准，效果可通过切换后的实测比较。
 - **延迟与丢包**基于 IPv4 ICMP。若目标无应答，可结合其他探测目标和实际访问情况判断。域名解析计时可能包含系统缓存命中。
+- **周边扫描**每 60 秒自动进行一次，也可以点击「重新检测」立即扫描。无线扫描会让部分网卡短暂离开当前信道，因此不宜过于频繁。
+- **导出的报告**只保留 MAC 地址的厂商前缀（如 `AA:BB:CC:**:**:**`），避免他人通过 BSSID 查询扫描地点。界面中仍显示完整地址。
 - **位置权限**可能影响 Windows 对 WLAN 信息的访问。遇到拒绝访问时，在「优化建议」中点击「打开位置权限设置」，检查定位服务和桌面应用权限，然后重新检测。延迟测试可独立运行。 [Microsoft WLAN 位置权限说明](https://learn.microsoft.com/zh-cn/windows/win32/nativewifi/wi-fi-access-location-changes)
 
 ---
@@ -76,7 +78,7 @@ Use **Rescan** (重新检测) to request a fresh scan. **Export report** (导出
 
 You need Windows, the Rust stable MSVC toolchain, and Visual Studio Build Tools with the **Desktop development with C++** workload. The project has been verified on Windows 11 x64. [Rust installation guide](https://rust-lang.org/tools/install/)
 
-Run these commands in PowerShell. For a private repository, sign in with a GitHub account that has access.
+Run these commands in PowerShell (Rust 1.87 or later is required).
 
 ```powershell
 git clone https://github.com/bTLzJazz/rust-win32-wifi-tool.git
@@ -91,6 +93,8 @@ You can also double-click `target\release\wifi_tool.exe` in File Explorer. Run `
 
 - **Channel suggestions** estimate congestion from the access points seen in a scan, their signal strengths, and channel overlap. Check which channels your router supports and compare performance after changing channels.
 - **Latency and packet loss** come from IPv4 ICMP probes. If a target gives no reply, compare it with other probe results and your actual connection. DNS timing can include a system cache hit.
+- **Nearby scans** run automatically every 60 seconds, or immediately when you click **Rescan**. Scanning makes some adapters leave the current channel briefly, so it is kept infrequent.
+- **Exported reports** keep only the vendor prefix of each MAC address (for example `AA:BB:CC:**:**:**`), so a shared report cannot be used to look up where it was taken. The app window still shows full addresses.
 - **Location permissions** can affect Windows access to WLAN information. If access is denied, open **Location settings** (打开位置权限设置) from **Recommendations** (优化建议), check location services and desktop app access, then rescan. The latency test runs independently. [Microsoft WLAN location access documentation](https://learn.microsoft.com/en-us/windows/win32/nativewifi/wi-fi-access-location-changes)
 
 ---

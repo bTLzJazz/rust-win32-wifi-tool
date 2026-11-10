@@ -15,6 +15,7 @@ use std::{
 use windows_sys::{
     Win32::{
         Foundation::{ERROR_ACCESS_DENIED, ERROR_BUFFER_OVERFLOW, HANDLE, INVALID_HANDLE_VALUE},
+        Globalization::{MB_ERR_INVALID_CHARS, MultiByteToWideChar},
         NetworkManagement::{IpHelper::*, WiFi::*},
         Networking::WinSock::{AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6, SOCKET_ADDRESS},
     },
@@ -57,6 +58,8 @@ pub struct Connection {
     pub ssid: String,
     pub bssid: [u8; 6],
     pub signal: u32,
+    /// Measured RSSI from the latest scan entry for this BSSID, when available.
+    pub rssi: Option<i32>,
     pub band: Band,
     pub channel: Option<u32>,
     pub phy: &'static str,
@@ -109,6 +112,8 @@ pub struct Snapshot {
     pub aps: Arc<Vec<AccessPoint>>,
     pub scan: Scan,
     pub route: Arc<Route>,
+    /// Number of the latest user rescan request whose scan has finished or failed.
+    pub rescan_done: u64,
 }
 
 impl Snapshot {
@@ -121,6 +126,21 @@ pub fn mac(bytes: &[u8; 6]) -> String {
     bytes.map(|byte| format!("{byte:02X}")).join(":")
 }
 
+/// Keeps the vendor prefix but hides the device-specific half, so a shared report
+/// cannot be used to look up the location of nearby access points.
+pub fn mac_masked(bytes: &[u8; 6]) -> String {
+    format!(
+        "{:02X}:{:02X}:{:02X}:**:**:**",
+        bytes[0], bytes[1], bytes[2]
+    )
+}
+
+/// Routers commonly derive guest, mesh and other virtual BSSIDs from the same base
+/// address: the locally administered bit or the last byte changes, the rest does not.
+pub fn same_device(a: &[u8; 6], b: &[u8; 6]) -> bool {
+    a == b || ((a[0] | 0x02) == (b[0] | 0x02) && a[1..5] == b[1..5])
+}
+
 pub fn ssid_label(ssid: &str) -> &str {
     if ssid.is_empty() {
         "（隐藏网络）"
@@ -131,10 +151,35 @@ pub fn ssid_label(ssid: &str) -> &str {
 
 fn ssid(raw: &DOT11_SSID) -> String {
     let len = (raw.uSSIDLength as usize).min(raw.ucSSID.len());
-    String::from_utf8_lossy(&raw.ucSSID[..len])
+    decode_ssid(&raw.ucSSID[..len])
         .chars()
         .map(|ch| if ch.is_control() { '�' } else { ch })
         .collect()
+}
+
+/// Many routers sold in China broadcast Chinese SSIDs as GBK rather than UTF-8.
+fn decode_ssid(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_owned(),
+        Err(_) => gbk(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+    }
+}
+
+fn gbk(bytes: &[u8]) -> Option<String> {
+    const CP_GBK: u32 = 936;
+    // An SSID is at most 32 bytes, which never decodes to more than 32 UTF-16 units.
+    let mut wide = [0u16; 64];
+    let len = unsafe {
+        MultiByteToWideChar(
+            CP_GBK,
+            MB_ERR_INVALID_CHARS,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            wide.len() as i32,
+        )
+    };
+    (len > 0).then(|| String::from_utf16_lossy(&wide[..len as usize]))
 }
 
 fn frequency(khz: u32) -> (Band, Option<u32>) {
@@ -149,6 +194,20 @@ fn frequency(khz: u32) -> (Band, Option<u32>) {
         _ => return (Band::Other, None),
     };
     (band, Some(channel))
+}
+
+/// Used when the scan list has no entry for the connected BSSID yet.
+#[allow(non_upper_case_globals)]
+fn infer_band(channel: u32, phy: DOT11_PHY_TYPE) -> Band {
+    // 802.11ax/be radios may be on 6 GHz, where channel numbers start again at 1.
+    if matches!(phy, dot11_phy_type_he | dot11_phy_type_eht) {
+        return Band::Other;
+    }
+    match channel {
+        1..=14 => Band::G24,
+        32..=196 => Band::G5,
+        _ => Band::Other,
+    }
 }
 
 #[allow(non_upper_case_globals)]
@@ -210,6 +269,7 @@ fn rsn_security(rsn: &[u8]) -> Option<&'static str> {
         (true, false) => "WPA2-Personal",
         _ if has(&[18]) => "OWE",
         _ if has(&[12, 13]) => "WPA3-Enterprise",
+        _ if has(&[1, 3, 5]) => "WPA2-Enterprise",
         _ => "RSN",
     })
 }
@@ -231,7 +291,8 @@ fn ap_security(mut ies: &[u8], privacy: bool) -> &'static str {
     if wpa {
         "WPA"
     } else if privacy {
-        "受保护"
+        // The privacy bit without RSN or WPA information elements means WEP.
+        "WEP"
     } else {
         "开放"
     }
@@ -302,6 +363,7 @@ impl Wlan {
         }
     }
 
+    #[allow(non_upper_case_globals)]
     fn current(&self, guid: &GUID, aps: &[AccessPoint]) -> Result<Connection, u32> {
         let attributes: WLAN_CONNECTION_ATTRIBUTES =
             unsafe { self.query(guid, wlan_intf_opcode_current_connection)? };
@@ -312,25 +374,40 @@ impl Wlan {
             .ok()
             .filter(|channel| *channel != 0);
         let matching_ap = ap.filter(|ap| channel.is_none() || ap.channel == channel);
-        let band = matching_ap.map_or(Band::Other, |ap| ap.band);
-        let phy = phy_name(assoc.dot11PhyType);
-        let cipher = cipher_name(security.dot11CipherAlgorithm);
+        let channel = channel.or_else(|| matching_ap.and_then(|ap| ap.channel));
+        let band = match (matching_ap, channel) {
+            (Some(ap), _) => ap.band,
+            (None, Some(channel)) => infer_band(channel, assoc.dot11PhyType),
+            (None, None) => Band::Other,
+        };
         Ok(Connection {
             ssid: ssid(&assoc.dot11Ssid),
             bssid: assoc.dot11Bssid,
             signal: assoc.wlanSignalQuality.min(100),
+            rssi: matching_ap.map(|ap| ap.rssi),
             band,
-            channel: channel.or_else(|| matching_ap.and_then(|ap| ap.channel)),
-            phy,
+            channel,
+            phy: phy_name(assoc.dot11PhyType),
             security: auth_name(security.dot11AuthAlgorithm),
-            cipher,
-            legacy_phy: matches!(phy, "802.11b" | "802.11a" | "802.11g" | "802.11n"),
-            weak_security: matches!(cipher, "WEP" | "TKIP")
-                || matches!(
-                    security.dot11AuthAlgorithm,
-                    DOT11_AUTH_ALGO_WPA | DOT11_AUTH_ALGO_WPA_NONE | DOT11_AUTH_ALGO_WPA_PSK
-                )
-                || security.bSecurityEnabled == 0,
+            cipher: cipher_name(security.dot11CipherAlgorithm),
+            legacy_phy: matches!(
+                assoc.dot11PhyType,
+                dot11_phy_type_hrdsss
+                    | dot11_phy_type_dsss
+                    | dot11_phy_type_ofdm
+                    | dot11_phy_type_erp
+                    | dot11_phy_type_ht
+            ),
+            weak_security: matches!(
+                security.dot11CipherAlgorithm,
+                DOT11_CIPHER_ALGO_WEP
+                    | DOT11_CIPHER_ALGO_WEP40
+                    | DOT11_CIPHER_ALGO_WEP104
+                    | DOT11_CIPHER_ALGO_TKIP
+            ) || matches!(
+                security.dot11AuthAlgorithm,
+                DOT11_AUTH_ALGO_WPA | DOT11_AUTH_ALGO_WPA_NONE | DOT11_AUTH_ALGO_WPA_PSK
+            ) || security.bSecurityEnabled == 0,
             rx: assoc.ulRxRate,
             tx: assoc.ulTxRate,
         })
@@ -472,7 +549,20 @@ pub fn route() -> Route {
     route
 }
 
+/// Background scans make many drivers leave the channel briefly, which shows up as
+/// latency spikes. Scan rarely on a timer; the user can still request a rescan.
+const SCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+fn settle(pending: &mut Option<u64>, done: &mut u64) {
+    if let Some(request) = pending.take() {
+        *done = request;
+    }
+}
+
 pub fn monitor(refresh: Receiver<()>, output: Sender<Snapshot>, testing: Arc<AtomicBool>) {
+    let mut requests = 0;
+    let mut pending = None;
+    let mut done = 0;
     let mut wlan = None;
     let mut aps = Arc::new(Vec::new());
     let mut current_route = Arc::new(route());
@@ -512,6 +602,7 @@ pub fn monitor(refresh: Receiver<()>, output: Sender<Snapshot>, testing: Arc<Ato
                     found.retain(|ap| seen.insert((ap.bssid, ap.band as u8, ap.channel)));
                     aps = Arc::new(found);
                     scan = result.unwrap_or(Scan::NoAdapter);
+                    settle(&mut pending, &mut done);
                 }
                 #[allow(non_upper_case_globals)]
                 for interface in interfaces
@@ -530,6 +621,7 @@ pub fn monitor(refresh: Receiver<()>, output: Sender<Snapshot>, testing: Arc<Ato
                 if connection_error == Some(ERROR_ACCESS_DENIED) {
                     aps = Arc::default();
                     scan = Scan::Denied;
+                    settle(&mut pending, &mut done);
                 } else if should_scan && scan_read.is_none() {
                     let mut requested = false;
                     for interface in &interfaces {
@@ -545,11 +637,13 @@ pub fn monitor(refresh: Receiver<()>, output: Sender<Snapshot>, testing: Arc<Ato
                         scan = Scan::Running;
                     } else {
                         aps = Arc::default();
+                        settle(&mut pending, &mut done);
                     }
                 }
             }
             result => {
                 scan_read = None;
+                settle(&mut pending, &mut done);
                 aps = Arc::default();
                 scan = match result {
                     Err(code) => {
@@ -561,7 +655,7 @@ pub fn monitor(refresh: Receiver<()>, output: Sender<Snapshot>, testing: Arc<Ato
             }
         }
         if should_scan {
-            scan_due = now + Duration::from_secs(15);
+            scan_due = now + SCAN_INTERVAL;
             current_route = Arc::new(route());
         }
         if output
@@ -571,6 +665,7 @@ pub fn monitor(refresh: Receiver<()>, output: Sender<Snapshot>, testing: Arc<Ato
                 aps: aps.clone(),
                 scan,
                 route: current_route.clone(),
+                rescan_done: done,
             })
             .is_err()
         {
@@ -578,9 +673,13 @@ pub fn monitor(refresh: Receiver<()>, output: Sender<Snapshot>, testing: Arc<Ato
         }
         match refresh.recv_timeout(Duration::from_secs(2)) {
             Ok(()) => {
+                requests += 1;
+                while refresh.try_recv().is_ok() {
+                    requests += 1;
+                }
+                pending = Some(requests);
                 current_route = Arc::new(route());
                 scan_due = Instant::now();
-                while refresh.try_recv().is_ok() {}
             }
             Err(RecvTimeoutError::Timeout) => (),
             Err(RecvTimeoutError::Disconnected) => break,
@@ -682,23 +781,35 @@ pub fn latency(gateway: Option<Ipv4Addr>) -> (Vec<Ping>, Option<f64>) {
         ("百度", DNS_NAME.into()),
     ]);
     thread::scope(|scope| {
-        let started = Instant::now();
-        let dns = (DNS_NAME, 80)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addrs| addrs.next())
-            .map(|_| started.elapsed().as_secs_f64() * 1000.0);
+        // Time name resolution alongside the probes so a slow resolver cannot delay them.
+        let dns = scope.spawn(|| {
+            let started = Instant::now();
+            (DNS_NAME, 80)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+                .map(|_| started.elapsed().as_secs_f64() * 1000.0)
+        });
         let workers: Vec<_> = targets
             .into_iter()
-            .map(|(name, host)| scope.spawn(move || probe(name, host)))
+            .map(|(name, host)| {
+                let label = host.clone();
+                (name, label, scope.spawn(move || probe(name, host)))
+            })
             .collect();
-        (
-            workers
-                .into_iter()
-                .map(|worker| worker.join().unwrap())
-                .collect(),
-            dns,
-        )
+        let pings = workers
+            .into_iter()
+            .map(|(name, host, worker)| {
+                worker.join().unwrap_or_else(|_| Ping {
+                    name,
+                    host,
+                    times: Vec::new(),
+                    sent: 0,
+                    error: Some("探测线程异常退出".into()),
+                })
+            })
+            .collect();
+        (pings, dns.join().ok().flatten())
     })
 }
 
@@ -720,6 +831,64 @@ mod tests {
             48, 18, 1, 0, 0, 15, 172, 4, 0, 0, 2, 0, 0, 15, 172, 2, 0, 15, 172, 8,
         ];
         assert_eq!(ap_security(&data, true), "WPA2/WPA3");
-        assert_eq!(ap_security(&data[..11], true), "受保护");
+        assert_eq!(ap_security(&data[..11], true), "WEP");
+    }
+
+    fn rsn(akm: u8) -> [u8; 20] {
+        [
+            48, 18, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, 4, 1, 0, 0, 15, 172, akm,
+        ]
+    }
+
+    #[test]
+    fn rsn_akm_suites() {
+        assert_eq!(ap_security(&rsn(1), true), "WPA2-Enterprise");
+        assert_eq!(ap_security(&rsn(5), true), "WPA2-Enterprise");
+        assert_eq!(ap_security(&rsn(2), true), "WPA2-Personal");
+        assert_eq!(ap_security(&rsn(8), true), "WPA3-Personal");
+        assert_eq!(ap_security(&rsn(18), true), "OWE");
+        assert_eq!(ap_security(&rsn(12), true), "WPA3-Enterprise");
+        assert_eq!(ap_security(&rsn(99), true), "RSN");
+    }
+
+    #[test]
+    fn legacy_wpa_and_open_networks() {
+        let wpa = [221, 4, 0, 0x50, 0xf2, 1];
+        assert_eq!(ap_security(&wpa, true), "WPA");
+        assert_eq!(ap_security(&[], false), "开放");
+        // A length that runs past the buffer must not be read.
+        assert_eq!(ap_security(&[48, 200, 1, 0], true), "WEP");
+    }
+
+    #[test]
+    fn frequency_band_edges() {
+        assert_eq!(frequency(2_472_000), (Band::G24, Some(13)));
+        assert_eq!(frequency(5_825_000), (Band::G5, Some(165)));
+        assert_eq!(frequency(5_935_000), (Band::G6, Some(2)));
+        assert_eq!(frequency(7_115_000), (Band::G6, Some(233)));
+        assert_eq!(frequency(2_400_000), (Band::Other, None));
+        assert_eq!(frequency(5_182_000), (Band::Other, None));
+    }
+
+    #[test]
+    fn band_inferred_from_channel_and_phy() {
+        assert_eq!(infer_band(6, dot11_phy_type_ht), Band::G24);
+        assert_eq!(infer_band(36, dot11_phy_type_vht), Band::G5);
+        assert_eq!(infer_band(5, dot11_phy_type_he), Band::Other);
+    }
+
+    #[test]
+    fn ssid_decoding_falls_back_to_gbk() {
+        assert_eq!(decode_ssid("咖啡店".as_bytes()), "咖啡店");
+        // "测试" encoded as GBK.
+        assert_eq!(decode_ssid(&[0xb2, 0xe2, 0xca, 0xd4]), "测试");
+    }
+
+    #[test]
+    fn related_bssids() {
+        let base = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        assert!(same_device(&base, &[0x12, 0x20, 0x30, 0x40, 0x50, 0x61]));
+        assert!(!same_device(&base, &[0x10, 0x20, 0x30, 0x41, 0x50, 0x60]));
+        assert_eq!(mac_masked(&base), "10:20:30:**:**:**");
     }
 }

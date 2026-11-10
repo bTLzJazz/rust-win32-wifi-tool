@@ -2,10 +2,13 @@
 name = "wifi_tool"
 version = "0.1.0"
 edition = "2024"
+# u32::is_multiple_of is stable since Rust 1.87.
+rust-version = "1.87"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
