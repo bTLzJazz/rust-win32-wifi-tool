@@ -1,4 +1,4 @@
-use crate::network::{AccessPoint, Band, Ping, Snapshot, mac, ssid_label};
+use crate::network::{AccessPoint, Band, Ping, Snapshot, mac, mac_masked, same_device, ssid_label};
 use std::fmt::Write;
 use windows_sys::Win32::NetworkManagement::IpHelper::IF_TYPE_ETHERNET_CSMACD;
 
@@ -9,7 +9,7 @@ const PICKS_5: &[u32] = &[36, 40, 44, 48, 149, 153, 157, 161];
 
 pub fn channel_score(aps: &[AccessPoint], own: Option<[u8; 6]>, band: Band, channel: u32) -> f64 {
     aps.iter()
-        .filter(|ap| ap.band == band && Some(ap.bssid) != own)
+        .filter(|ap| ap.band == band && !own.is_some_and(|own| same_device(&own, &ap.bssid)))
         .filter_map(|ap| ap.channel.map(|other| (ap.signal, other.abs_diff(channel))))
         .map(|(signal, diff)| {
             let weight = match band {
@@ -282,7 +282,7 @@ pub fn advice(snapshot: &Snapshot, pings: &[Ping], dns_ms: Option<f64>) -> Advic
                 .filter(|ap| {
                     ap.band == c.band
                         && ap.channel == Some(channel)
-                        && ap.bssid != c.bssid
+                        && !same_device(&ap.bssid, &c.bssid)
                         && ap.signal >= 30
                 })
                 .count();
@@ -351,7 +351,11 @@ pub fn advice(snapshot: &Snapshot, pings: &[Ping], dns_ms: Option<f64>) -> Advic
         .filter(|p| !p.gateway() && p.sent != 0)
         .collect();
     if !outside.is_empty() {
-        let replies: Vec<_> = outside.iter().filter_map(|p| p.stats()).collect();
+        // A target that never answers usually filters ICMP. Judge loss from the ones that answer.
+        let replies: Vec<_> = outside
+            .iter()
+            .filter_map(|p| Some((p, p.stats()?)))
+            .collect();
         if replies.is_empty() {
             score -= 30.0;
             add(
@@ -360,8 +364,9 @@ pub fn advice(snapshot: &Snapshot, pings: &[Ping], dns_ms: Option<f64>) -> Advic
                 "请结合网页访问情况判断是否断网。部分网络或目标会屏蔽 ICMP。",
             );
         } else {
-            let avg = replies.iter().map(|s| s.average).sum::<f64>() / replies.len() as f64;
-            let loss = outside.iter().filter_map(|p| p.loss()).sum::<f64>() / outside.len() as f64;
+            let avg = replies.iter().map(|(_, s)| s.average).sum::<f64>() / replies.len() as f64;
+            let loss =
+                replies.iter().filter_map(|(p, _)| p.loss()).sum::<f64>() / replies.len() as f64;
             if loss >= 5.0 || avg > 80.0 {
                 score -= (loss * 0.5 + (avg - 60.0).max(0.0) * 0.1).min(15.0);
                 let detail = if gateway_stable == Some(true) {
@@ -379,6 +384,18 @@ pub fn advice(snapshot: &Snapshot, pings: &[Ping], dns_ms: Option<f64>) -> Advic
                     Level::Good,
                     format!("外网探测延迟较低（平均 {avg:.0} ms）"),
                     "本次探测的延迟与丢包处于较低水平。",
+                );
+            }
+            let silent: Vec<_> = outside
+                .iter()
+                .filter(|p| p.times.is_empty())
+                .map(|p| p.name)
+                .collect();
+            if !silent.is_empty() {
+                add(
+                    Level::Info,
+                    format!("{} 未回复 ICMP 探测", silent.join("、")),
+                    "其他外网目标均有应答，该目标可能屏蔽 ICMP，未计入外网延迟与丢包统计。",
                 );
             }
         }
@@ -400,8 +417,9 @@ pub fn advice(snapshot: &Snapshot, pings: &[Ping], dns_ms: Option<f64>) -> Advic
     }
 }
 
-pub fn connection_rows(snapshot: &Snapshot) -> Vec<(&'static str, String)> {
+pub fn connection_rows(snapshot: &Snapshot, mask_mac: bool) -> Vec<(&'static str, String)> {
     let blank = "—";
+    let show_mac: fn(&[u8; 6]) -> String = if mask_mac { mac_masked } else { mac };
     let mut rows = if let Some(c) = &snapshot.connection {
         let rate = |value| {
             if value == 0 {
@@ -410,10 +428,14 @@ pub fn connection_rows(snapshot: &Snapshot) -> Vec<(&'static str, String)> {
                 format!("{:.1} Mbps", f64::from(value) / 1000.0)
             }
         };
-        let rssi = f64::from(c.signal) / 2.0 - 100.0;
+        // Prefer the RSSI measured in the scan; otherwise estimate it from link quality.
+        let rssi = c.rssi.map_or_else(
+            || format!("约 {:.0} dBm", f64::from(c.signal) / 2.0 - 100.0),
+            |rssi| format!("{rssi} dBm"),
+        );
         vec![
             ("网络名称", ssid_label(&c.ssid).into()),
-            ("无线信号", format!("{}%（约 {rssi:.0} dBm）", c.signal)),
+            ("无线信号", format!("{}%（{rssi}）", c.signal)),
             (
                 "频段 / 信道",
                 format!(
@@ -428,7 +450,7 @@ pub fn connection_rows(snapshot: &Snapshot) -> Vec<(&'static str, String)> {
                 format!("{} / {}", rate(c.rx), rate(c.tx)),
             ),
             ("认证 / 加密", format!("{} / {}", c.security, c.cipher)),
-            ("接入点 MAC", mac(&c.bssid)),
+            ("接入点 MAC", show_mac(&c.bssid)),
         ]
     } else {
         let status = if snapshot.denied() {
@@ -500,13 +522,27 @@ pub fn ping_row(ping: &Ping) -> [String; 8] {
     ]
 }
 
-pub fn report(snapshot: &Snapshot, pings: &[Ping], dns_ms: Option<f64>, stamp: &str) -> String {
+/// With `mask_mac`, the device-specific half of every MAC address is hidden, because
+/// BSSIDs in a shared report can be used to look up where the scan was taken.
+pub fn report(
+    snapshot: &Snapshot,
+    pings: &[Ping],
+    dns_ms: Option<f64>,
+    stamp: &str,
+    mask_mac: bool,
+) -> String {
     let advice = advice(snapshot, pings, dns_ms);
+    let show_mac: fn(&[u8; 6]) -> String = if mask_mac { mac_masked } else { mac };
+    let note = if mask_mac {
+        "\r\n（为保护隐私，MAC 地址仅保留厂商前缀）"
+    } else {
+        ""
+    };
     let mut report = format!(
-        "\u{feff}WiFi 检测报告  {stamp}\r\n健康评分  {}\r\n\r\n[当前连接]\r\n",
+        "\u{feff}WiFi 检测报告  {stamp}{note}\r\n健康评分  {}\r\n\r\n[当前连接]\r\n",
         advice.summary()
     );
-    for (key, value) in connection_rows(snapshot) {
+    for (key, value) in connection_rows(snapshot, mask_mac) {
         let _ = write!(report, "{key}  {value}\r\n");
     }
     let _ = write!(
@@ -522,7 +558,7 @@ pub fn report(snapshot: &Snapshot, pings: &[Ping], dns_ms: Option<f64>, stamp: &
             ap.rssi,
             ap.band.name(),
             ap.channel.map_or_else(|| "—".into(), |c| c.to_string()),
-            mac(&ap.bssid),
+            show_mac(&ap.bssid),
             ap.phy,
             ap.security,
             ssid_label(&ap.ssid)
@@ -584,5 +620,70 @@ mod tests {
             (15.0, 5, 30, 12.5)
         );
         assert_eq!(ping.loss(), Some(62.5));
+    }
+
+    fn ap(bssid: [u8; 6], channel: u32) -> AccessPoint {
+        AccessPoint {
+            ssid: String::new(),
+            bssid,
+            signal: 100,
+            rssi: -40,
+            band: Band::G24,
+            channel: Some(channel),
+            phy: "—",
+            security: "—",
+        }
+    }
+
+    #[test]
+    fn interference_ignores_virtual_bssids_of_own_router() {
+        let own = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let guest = [0x12, 0x20, 0x30, 0x40, 0x50, 0x61];
+        let neighbor = [0x30, 0x20, 0x30, 0x40, 0x50, 0x60];
+        let aps = [ap(own, 6), ap(guest, 6), ap(neighbor, 6)];
+        assert!((channel_score(&aps, Some(own), Band::G24, 6) - 1.0).abs() < 1e-9);
+    }
+
+    fn ping(name: &'static str, times: Vec<u32>) -> Ping {
+        Ping {
+            name,
+            host: String::new(),
+            times,
+            sent: 8,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn silent_target_is_not_counted_as_packet_loss() {
+        let pings = [
+            ping("阿里 DNS", vec![10; 8]),
+            ping("腾讯 DNS", vec![12; 8]),
+            ping("百度", Vec::new()),
+        ];
+        let advice = advice(&Snapshot::default(), &pings, Some(20.0));
+        assert_eq!(advice.score, Some(100));
+        assert!(advice.text().contains("百度 未回复 ICMP 探测"));
+        assert!(!advice.text().contains("外网探测波动"));
+    }
+
+    #[test]
+    fn all_targets_silent_is_reported() {
+        let pings = [ping("阿里 DNS", Vec::new()), ping("百度", Vec::new())];
+        let advice = advice(&Snapshot::default(), &pings, None);
+        assert_eq!(advice.score, Some(70));
+        assert!(advice.text().contains("外网目标未回复 ICMP 探测"));
+    }
+
+    #[test]
+    fn report_masks_mac_addresses() {
+        let snapshot = Snapshot {
+            aps: std::sync::Arc::new(vec![ap([0xAA, 0xBB, 0xCC, 1, 2, 3], 1)]),
+            ..Snapshot::default()
+        };
+        let masked = report(&snapshot, &[], None, "now", true);
+        assert!(masked.contains("AA:BB:CC:**:**:**"));
+        assert!(!masked.contains("AA:BB:CC:01:02:03"));
+        assert!(report(&snapshot, &[], None, "now", false).contains("AA:BB:CC:01:02:03"));
     }
 }
